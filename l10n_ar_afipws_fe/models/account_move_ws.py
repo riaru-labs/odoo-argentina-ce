@@ -150,30 +150,32 @@ class AccountMove(models.Model):
     def pyafipws_add_tax(self, ws, base_lines=None):
         vat_items = self._get_vat(base_lines=base_lines)
         for item in vat_items:
-            ws.AgregarIva(item["Id"], "%.2f" % item["BaseImp"], "%.2f" % item["Importe"])
+            ws.AgregarIva(
+                item["Id"],
+                "%.2f" % item["BaseImp"],
+                "%.2f" % item["Importe"],
+            )
 
         not_vat_taxes = self.line_ids.filtered(
-            lambda x: x.tax_line_id and x.tax_line_id.tax_group_id.l10n_ar_tribute_afip_code
+            lambda x:
+                x.tax_line_id
+                and x.tax_line_id.tax_group_id.l10n_ar_tribute_afip_code
+                and not x.tax_line_id.tax_group_id.l10n_ar_vat_afip_code
         )
+
         for tax in not_vat_taxes:
+            base = tax.tax_base_amount
+            importe = abs(tax.balance)
+
+            if not base or not importe:
+                continue
+
             ws.AgregarTributo(
                 tax.tax_line_id.tax_group_id.l10n_ar_tribute_afip_code,
                 tax.tax_line_id.tax_group_id.name,
-                "%.2f"
-                % sum(
-                    self.invoice_line_ids.filtered(
-                        lambda x: x.tax_ids.filtered(
-                            lambda y: y.tax_group_id.l10n_ar_tribute_afip_code
-                            == tax.tax_line_id.tax_group_id.l10n_ar_tribute_afip_code
-                        )
-                    ).mapped("price_subtotal")
-                ),
-                # "%.2f" % abs(tax.base_amount),
-                # TODO pasar la alicuota
-                # como no tenemos la alicuota pasamos cero, en v9
-                # podremos pasar la alicuota
+                "%.2f" % base,
                 0,
-                "%.2f" % tax.price_subtotal,
+                "%.2f" % importe,
             )
 
     def wsfe_invoice_add_info(self, ws, invoice_info):
