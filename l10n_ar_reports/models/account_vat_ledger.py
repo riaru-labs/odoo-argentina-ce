@@ -295,14 +295,41 @@ class AccountVatLedger(models.Model):
             doc_code = "80"
         return doc_code, doc_number.rjust(20, "0")
 
+    # Deprecated odoo 13 method
+    # @api.model
+    # def _get_pos_and_invoice_invoice_number(self, invoice):
+    #     res = invoice._l10n_ar_get_document_number_parts(
+    #         invoice.l10n_latam_document_number, invoice.l10n_latam_document_type_id.code
+    #     )
+    #     return "{:0>20d}".format(res["invoice_number"]), "{:0>5d}".format(
+    #         res["point_of_sale"]
+    #     )
+
     @api.model
     def _get_pos_and_invoice_invoice_number(self, invoice):
-        res = invoice._l10n_ar_get_document_number_parts(
-            invoice.l10n_latam_document_number, invoice.l10n_latam_document_type_id.code
-        )
-        return "{:0>20d}".format(res["invoice_number"]), "{:0>5d}".format(
-            res["point_of_sale"]
-        )
+        doc_number = invoice.l10n_latam_document_number or ""
+        
+        # Try the standard method first
+        try:
+            res = invoice._l10n_ar_get_document_number_parts(
+                doc_number, invoice.l10n_latam_document_type_id.code
+            )
+            return "{:0>20d}".format(res["invoice_number"]), "{:0>5d}".format(
+                res["point_of_sale"]
+            )
+        except (ValueError, TypeError):
+            pass
+
+        # Fallback: Try parsing alternative formats
+        # Ej: "RE-00001", "RE00001", "00001", etc.
+        # Extract only the digicts from the number
+        digits_only = re.sub(r"[^0-9]", "", doc_number)
+        
+        if digits_only:
+            return "{:0>20d}".format(int(digits_only)), "{:0>5d}".format(0)
+        
+        # If there are no digits at all, we use zeros
+        return "{:0>20d}".format(0), "{:0>5d}".format(0)
 
     def _get_txt_invoices(self):
         self.ensure_one()
