@@ -86,6 +86,12 @@ class ResPartner(models.Model):
         else:
             _logger.info("We couldn't infer the AFIP responsability from padron, you" "must set it manually.")
 
+        if census.actividades:
+            actividades = self.env["afip.activity"].search(
+                [("code", "in", census.actividades)]
+            )
+            if actividades:
+                vals["actividades_padron"] = actividades.ids
         return vals
 
     def get_data_from_padron_afip(self):
