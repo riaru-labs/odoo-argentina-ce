@@ -167,7 +167,8 @@ class AccountMove(models.Model):
             base = tax.tax_base_amount
             importe = abs(tax.balance)
 
-            if not base or not importe:
+            # if not base or not importe:  # base puede ser 0 en percepciones --SW-1840
+            if not importe:
                 continue
 
             ws.AgregarTributo(
