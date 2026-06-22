@@ -339,6 +339,11 @@ class AccountMove(models.Model):
         return (with_number or pool)[:1]
 
     def _post(self, soft=True):
+        # using invoice_date and invoice_date_due as PeriodoAsoc boundaries. --SW-1887
+        for move in self:
+            if move.l10n_latam_document_type_id.internal_type == "debit_note":
+                move.afip_associated_period_from = move.invoice_date or fields.Date.context_today(move)
+                move.afip_associated_period_to = move.invoice_date_due or move.invoice_date or fields.Date.context_today(move)
         request_cae_invoices = self.filtered(
             lambda x: x.company_id.country_id.code == "AR"
             and x.is_invoice()
