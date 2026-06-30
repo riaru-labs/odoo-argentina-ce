@@ -350,7 +350,9 @@ class AccountMove(models.Model):
             invoice_info["imp_neto"] = str("%.2f" % amounts["vat_taxable_amount"])
 
         invoice_info["imp_iva"] = str("%.2f" % amounts["vat_amount"])
-        invoice_info["imp_trib"] = str("%.2f" % amounts["not_vat_taxes_amount"])
+        not_vat_tax_lines = self.line_ids.filtered(lambda x: x.tax_line_id and x.tax_line_id.tax_group_id.l10n_ar_tribute_afip_code and not x.tax_line_id.tax_group_id.l10n_ar_vat_afip_code)
+        invoice_info["imp_trib"] = str("%.2f" % sum(abs(t.balance) for t in not_vat_tax_lines))
+        #invoice_info["imp_trib"] = str("%.2f" % amounts["not_vat_taxes_amount"]) --recalculo erroneo SW-1951
         invoice_info["imp_op_ex"] = str("%.2f" % amounts["vat_exempt_base_amount"])
         invoice_info["moneda_id"] = self.currency_id.l10n_ar_afip_code
         rate = self.invoice_currency_rate or 1.0
