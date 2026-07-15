@@ -359,7 +359,7 @@ class AccountMove(models.Model):
         # no se pasa iva. Probamos hacer que vat_taxable_amount
         # incorpore a los imp cod 0, pero en ese caso termina reportando
         # iva y no lo queremos
-        if self.l10n_latam_document_type_id.l10n_ar_letter == "C":
+        if self.l10n_latam_document_type_id.l10n_ar_letter in ("B", "C"):
             invoice_info["imp_neto"] = str("%.2f" % self.amount_untaxed)
         else:
             invoice_info["imp_neto"] = str("%.2f" % amounts["vat_taxable_amount"])
