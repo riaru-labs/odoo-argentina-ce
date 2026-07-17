@@ -126,16 +126,60 @@ class AccountVatLedger(models.Model):
     @api.depends("journal_ids", "date_from", "date_to")
     def _compute_invoices(self):
         for rec in self:
-            rec.invoice_ids = rec.env["account.ar.vat.line"].search(
-                [
-                    ("state", "!=", "draft"),
-                    # ('number', '!=', False),
-                    # ('internal_number', '!=', False),
-                    ("journal_id", "in", rec.journal_ids.ids),
-                    ("date", ">=", rec.date_from),
-                    ("date", "<=", rec.date_to),
-                ]
-            )
+            if not rec.journal_ids or not rec.date_from or not rec.date_to:
+                rec.invoice_ids = False
+                continue
+            rec.invoice_ids = rec._get_vat_line_ids()
+
+    def _get_vat_line_ids(self):
+        """account.ar.vat.line es una vista SQL (ver account_ar_vat_line.py)
+        que agrega con SUM/CASE sobre account_move_line para calcular los
+        importes por alícuota. Para armar invoice_ids solo necesitamos saber
+        qué comprobantes califican, no esos importes agregados, así que
+        consultamos account_move directamente (mismo criterio que el WHERE
+        de la vista) y evitamos que postgres calcule toda esa agregación
+        solo para descartarla. account.ar.vat.line.id == account_move.id
+        (la vista selecciona "am.id" como id), por eso se puede hacer
+        browse() directo con estos ids.
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            """
+            SELECT am.id
+            FROM account_move am
+            WHERE am.company_id = %(company_id)s
+              AND am.journal_id = ANY(%(journal_ids)s)
+              AND am.date >= %(date_from)s
+              AND am.date <= %(date_to)s
+              AND am.state != 'draft'
+              AND am.move_type IN
+                  ('out_invoice', 'in_invoice', 'out_refund', 'in_refund')
+              AND EXISTS (
+                  SELECT 1
+                  FROM account_move_line aml
+                  LEFT JOIN account_move_line_account_tax_rel amltr
+                      ON amltr.account_move_line_id = aml.id
+                  LEFT JOIN account_tax bt
+                      ON bt.id = amltr.account_tax_id
+                  LEFT JOIN account_tax_group btg
+                      ON btg.id = bt.tax_group_id
+                  WHERE aml.move_id = am.id
+                    AND (
+                        aml.tax_line_id IS NOT NULL
+                        OR btg.l10n_ar_vat_afip_code IS NOT NULL
+                    )
+              )
+            ORDER BY am.date, am.name
+            """,
+            {
+                "company_id": self.company_id.id,
+                "journal_ids": self.journal_ids.ids,
+                "date_from": self.date_from,
+                "date_to": self.date_to,
+            },
+        )
+        ids = [row[0] for row in self.env.cr.fetchall()]
+        return self.env["account.ar.vat.line"].browse(ids)
 
     @api.depends(
         "type",
@@ -306,9 +350,12 @@ class AccountVatLedger(models.Model):
 
     def _get_txt_invoices(self):
         self.ensure_one()
+        # invoice_ids.move_id es siempre igual a invoice_ids.id (ver
+        # account_ar_vat_line.py: "am.id as move_id"), así que usamos los
+        # ids directamente en vez de forzar otra lectura de la vista pesada.
         return self.env["account.move"].search(
             [
-                ("id", "in", self.invoice_ids.mapped("move_id").ids),
+                ("id", "in", self.invoice_ids.ids),
                 ("l10n_latam_document_type_id.code", "!=", False),
             ],
             order="invoice_date asc, name asc, id asc",
