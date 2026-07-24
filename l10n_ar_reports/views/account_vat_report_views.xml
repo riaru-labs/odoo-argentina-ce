@@ -65,12 +65,6 @@
                                     <field name="import_aliquots_file" filename="import_aliquots_filename"/>
                                 </group>
                             </group>
-                            <group col="1" groups="base.group_no_one">
-                                <!-- <field name="REGINFO_CV_CABECERA"/> -->
-                                <field name="REGINFO_CV_CBTE"/>
-                                <field name="REGINFO_CV_ALICUOTAS"/>
-                                <field name="REGINFO_CV_COMPRAS_IMPORTACIONES" invisible="type != 'purchase'"/>
-                            </group>
                         </page>
                         <page string="Notes" name="notes">
                             <field name="note"/>

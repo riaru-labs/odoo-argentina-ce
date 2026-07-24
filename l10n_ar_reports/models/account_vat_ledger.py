@@ -2,8 +2,11 @@
 # For copyright and license notices, see __manifest__.py file in module root
 # directory
 ##############################################################################
+from collections import defaultdict
+
 from odoo import models, fields, api, _
-from odoo.exceptions import ValidationError
+from odoo.exceptions import RedirectWarning, ValidationError
+from odoo.tools.float_utils import float_round
 import base64
 import re
 
@@ -77,38 +80,14 @@ class AccountVatLedger(models.Model):
         "account.ar.vat.line", string="Invoices", compute="_compute_invoices"
     )
     # txt for citi / libro iva fields
-    REGINFO_CV_ALICUOTAS = fields.Text(
-        "REGINFO_CV_ALICUOTAS",
-        readonly=True,
-    )
-    REGINFO_CV_COMPRAS_IMPORTACIONES = fields.Text(
-        "REGINFO_CV_COMPRAS_IMPORTACIONES",
-        readonly=True,
-    )
-    REGINFO_CV_CBTE = fields.Text(
-        "REGINFO_CV_CBTE",
-        readonly=True,
-    )
-    REGINFO_CV_CABECERA = fields.Text(
-        "REGINFO_CV_CABECERA",
-        readonly=True,
-    )
-    vouchers_file = fields.Binary(compute="_compute_files", readonly=True)
-    vouchers_filename = fields.Char(
-        compute="_compute_files",
-    )
-    aliquots_file = fields.Binary(
-        compute="_compute_files",
-    )
-    aliquots_filename = fields.Char(
-        compute="_compute_files",
-    )
-    import_aliquots_file = fields.Binary(
-        compute="_compute_files",
-    )
-    import_aliquots_filename = fields.Char(
-        compute="_compute_files",
-    )
+    # Los binarios se arman y guardan directo en compute_txt_data (ver
+    # _set_txt_file)
+    vouchers_file = fields.Binary(readonly=True)
+    vouchers_filename = fields.Char(readonly=True)
+    aliquots_file = fields.Binary(readonly=True)
+    aliquots_filename = fields.Char(readonly=True)
+    import_aliquots_file = fields.Binary(readonly=True)
+    import_aliquots_filename = fields.Char(readonly=True)
     prorate_tax_credit = fields.Boolean()
     prorate_type = fields.Selection(
         [("global", "Global"), ("by_voucher", "By Voucher")],
@@ -132,15 +111,12 @@ class AccountVatLedger(models.Model):
             rec.invoice_ids = rec._get_vat_line_ids()
 
     def _get_vat_line_ids(self):
-        """account.ar.vat.line es una vista SQL (ver account_ar_vat_line.py)
-        que agrega con SUM/CASE sobre account_move_line para calcular los
-        importes por alícuota. Para armar invoice_ids solo necesitamos saber
-        qué comprobantes califican, no esos importes agregados, así que
-        consultamos account_move directamente (mismo criterio que el WHERE
-        de la vista) y evitamos que postgres calcule toda esa agregación
-        solo para descartarla. account.ar.vat.line.id == account_move.id
-        (la vista selecciona "am.id" como id), por eso se puede hacer
-        browse() directo con estos ids.
+        """account.ar.vat.line es una vista SQL pesada (agrega con
+        SUM/CASE). Solo necesitamos saber que comprobantes califican, no
+        sus importes, asi que replicamos el WHERE contra account_move
+        directo y evitamos que postgres agregue todo para descartarlo.
+        account.ar.vat.line.id == account_move.id, por eso el browse()
+        con estos ids es valido.
         """
         self.ensure_one()
         self.env.cr.execute(
@@ -246,72 +222,142 @@ class AccountVatLedger(models.Model):
             template = "{:0>%dd}" % (padding)
         return template.format(int(round(abs(amount) * 10**decimals, decimals)))
 
-    @api.depends(
-        "REGINFO_CV_CBTE",
-        "REGINFO_CV_ALICUOTAS",
-        "type",
-        # 'period_id.name'
-    )
-    def _compute_files(self):
+    def _set_txt_file(self, file_field, filename_field, filename_label, lines):
+        """Arma el binario del txt directo desde las lineas ya generadas y
+        lo guarda en los campos correspondientes
+        """
         self.ensure_one()
-        # segun vimos aca la afip espera "ISO-8859-1" en vez de utf-8
-        # http://www.planillasutiles.com.ar/2015/08/
-        # como-descargar-los-archivos-de.html
-        if self.REGINFO_CV_ALICUOTAS:
-            self.aliquots_filename = _("Alicuots_%s_%s.txt") % (
+        content = "\r\n".join(lines)
+        if content:
+            self[filename_field] = _("%s_%s_%s.txt") % (
+                filename_label,
                 self.type,
                 self.date_to,
-                # self.period_id.name
             )
-            self.aliquots_file = base64.encodebytes(
-                self.REGINFO_CV_ALICUOTAS.encode("ISO-8859-1")
-            )
+            self[file_field] = base64.encodebytes(content.encode("ISO-8859-1"))
         else:
-            self.aliquots_file = False
-            self.aliquots_filename = False
-        if self.REGINFO_CV_COMPRAS_IMPORTACIONES:
-            self.import_aliquots_filename = _("Import_Alicuots_%s_%s.txt") % (
-                self.type,
-                self.date_to,
-                # self.period_id.name
+            self[file_field] = False
+            self[filename_field] = False
+
+    _TXT_CHUNK_SIZE = 500
+
+    def compute_txt_data(self):
+        self.ensure_one()
+        # buscamos los comprobantes una sola vez, se reutilizan en las 3
+        # secciones del txt
+        invoices = self._get_txt_invoices()
+
+        # estos dos son iguales para toda la liquidacion (dependen de la
+        # compania, no de cada factura), asi que se calculan una sola vez
+        # en vez de una vez por factura
+        profits_tax_group = (
+            self.env["account.chart.template"]
+            .with_company(self.company_id)
+            .ref("tax_group_percepcion_ganancias", raise_if_not_found=False)
+        )
+        if not profits_tax_group:
+            raise RedirectWarning(
+                _(
+                    "A required tax group could not be found (XML ID: %s).\n"
+                    "Please reload your chart template in order to reinstall the required tax group.\n\n"
+                    "Note: You might have to relink your existing taxes to this new tax group.",
+                    "tax_group_percepcion_ganancias",
+                ),
+                self.env.ref("account.action_account_config").id,
+                _("Accounting Settings"),
             )
-            self.import_aliquots_file = base64.encodebytes(
-                self.REGINFO_CV_COMPRAS_IMPORTACIONES.encode("ISO-8859-1")
+        tax_group_by_id = {
+            tg.id: tg for tg in self.env["account.tax.group"].search([])
+        }
+
+        aliquot_lines = []
+        import_aliquot_lines = []
+        cbte_lines = []
+
+        for offset in range(0, len(invoices), self._TXT_CHUNK_SIZE):
+            chunk = invoices[offset : offset + self._TXT_CHUNK_SIZE]
+            # precarga en pocas queries los campos many2many (tax_ids,
+            # sale_line_ids, etc.) que si no el ORM pide de a uno por
+            # comprobante
+            self._prefetch_txt_data(chunk)
+            # base_lines se calcula una vez por factura y se reutiliza en
+            # _get_invoice_vat_and_amounts (que a su vez fusiona en una
+            # sola pasada lo que antes eran 7 pasadas separadas)
+            vat_and_amounts_map = {
+                inv: self._get_invoice_vat_and_amounts(
+                    inv,
+                    inv._get_rounded_base_and_tax_lines()[0],
+                    profits_tax_group,
+                    tax_group_by_id,
+                )
+                for inv in chunk
+            }
+
+            for inv in chunk:
+                vat_taxes, amounts = vat_and_amounts_map[inv]
+                if inv.l10n_latam_document_type_id.code == "66":
+                    if self.type == "purchase":
+                        inv_lines = self._get_invoice_alicuota_lines(
+                            inv, vat_taxes, impo=True
+                        )
+                        import_aliquot_lines += inv_lines
+                    else:
+                        inv_lines = []
+                else:
+                    inv_lines = self._get_invoice_alicuota_lines(
+                        inv, vat_taxes, impo=False
+                    )
+                    aliquot_lines += inv_lines
+                cbte_lines.append(
+                    self._get_invoice_cbte_row(inv, amounts, len(inv_lines))
+                )
+
+            # libera cache entre lotes: con 70000+ comprobantes la
+            # memoria crece sin limite si no
+            self.env.invalidate_all()
+
+        self._set_txt_file(
+            "aliquots_file", "aliquots_filename", "Alicuots", aliquot_lines
+        )
+        if self.type == "purchase":
+            self._set_txt_file(
+                "import_aliquots_file",
+                "import_aliquots_filename",
+                "Import_Alicuots",
+                import_aliquot_lines,
             )
         else:
             self.import_aliquots_file = False
             self.import_aliquots_filename = False
-        if self.REGINFO_CV_CBTE:
-            self.vouchers_filename = _("Vouchers_%s_%s.txt") % (
-                self.type,
-                self.date_to,
-                # self.period_id.name
-            )
-            self.vouchers_file = base64.encodebytes(
-                self.REGINFO_CV_CBTE.encode("ISO-8859-1")
-            )
-        else:
-            self.vouchers_file = False
-            self.vouchers_filename = False
+        self._set_txt_file("vouchers_file", "vouchers_filename", "Vouchers", cbte_lines)
 
-    def compute_txt_data(self):
-        alicuotas = self._get_REGINFO_CV_ALICUOTAS()
-        # sacamos todas las lineas y las juntamos
-        lines = []
-        for k, v in alicuotas.items():
-            lines += v
-        self.REGINFO_CV_ALICUOTAS = "\r\n".join(lines)
-
-        impo_alicuotas = {}
-        if self.type == "purchase":
-            impo_alicuotas = self._get_REGINFO_CV_ALICUOTAS(impo=True)
-            # sacamos todas las lineas y las juntamos
-            lines = []
-            for k, v in impo_alicuotas.items():
-                lines += v
-            self.REGINFO_CV_COMPRAS_IMPORTACIONES = "\r\n".join(lines)
-        alicuotas.update(impo_alicuotas)
-        self._get_REGINFO_CV_CBTE(alicuotas)
+    def _prefetch_txt_data(self, invoices):
+        if not invoices:
+            return
+        invoices.line_ids.mapped("tax_ids")
+        # tax_tag_ids: lo lee _prepare_tax_line_for_taxes_computation en
+        # las lineas de impuesto
+        invoices.line_ids.mapped("tax_tag_ids")
+        sale_lines = invoices.line_ids.mapped("sale_line_ids")
+        # leidos por sale.order.line._is_discount_line()/
+        # _get_downpayment_lines() al armar base_lines
+        sale_lines.mapped("is_downpayment")
+        sale_lines.mapped("invoice_lines")
+        sale_lines.mapped("reward_id.reward_type")
+        sale_lines.mapped("company_id.sale_discount_product_id")
+        # _get_partner_document_code_and_number usa partner_id o
+        # commercial_partner_id segun el caso; precargamos ambos
+        partners = invoices.mapped("partner_id") | invoices.mapped(
+            "commercial_partner_id"
+        )
+        partners.mapped("l10n_ar_afip_responsibility_type_id")
+        partners.mapped("l10n_latam_identification_type_id.l10n_ar_afip_code")
+        partners.mapped(
+            "commercial_partner_id.country_id.l10n_ar_legal_entity_vat"
+        )
+        partners.mapped("commercial_partner_id.country_id.l10n_ar_natural_vat")
+        invoices.mapped("l10n_latam_document_type_id")
+        invoices.mapped("currency_id")
 
     @api.model
     def _get_partner_document_code_and_number(self, partner):
@@ -350,9 +396,8 @@ class AccountVatLedger(models.Model):
 
     def _get_txt_invoices(self):
         self.ensure_one()
-        # invoice_ids.move_id es siempre igual a invoice_ids.id (ver
-        # account_ar_vat_line.py: "am.id as move_id"), así que usamos los
-        # ids directamente en vez de forzar otra lectura de la vista pesada.
+        # invoice_ids.id ya es el id de account.move (ver
+        # account_ar_vat_line.py), usamos eso en vez de leer la vista pesada
         return self.env["account.move"].search(
             [
                 ("id", "in", self.invoice_ids.ids),
@@ -361,232 +406,339 @@ class AccountVatLedger(models.Model):
             order="invoice_date asc, name asc, id asc",
         )
 
-    def _get_REGINFO_CV_CBTE(self, alicuotas):
+    def _get_invoice_vat_and_amounts(
+        self, inv, base_lines, profits_tax_group, tax_group_by_id
+    ):
+        """Combina _get_vat()/_l10n_ar_get_amounts() de l10n_ar en una
+        sola pasada: sus 7 agrupaciones dependen todas del mismo dato
+        (tax_group_id de cada impuesto), asi que agrupamos una vez por
+        tax_group_id y derivamos el resto sumando en Python.
+        """
         self.ensure_one()
-        res = []
-        invoices = self._get_txt_invoices()
-        for inv in invoices:
-            # si no existe la factura en alicuotas es porque no tienen ninguna
-            cant_alicuotas = len(alicuotas.get(inv))
+        AccountTax = self.env["account.tax"]
 
-            currency_rate = inv.invoice_currency_rate
-            currency_code = inv.currency_id.l10n_ar_afip_code
+        def group_by_tax_group(_base_line, tax_data):
+            tax_data = tax_data or {"tax": self.env["account.tax"]}
+            return {"tax_group_id": tax_data["tax"].tax_group_id.id}
 
-            invoice_number, pos_number = self._get_pos_and_invoice_invoice_number(inv)
-            doc_code, doc_number = self._get_partner_document_code_and_number(
-                inv.partner_id
+        aggregated = AccountTax._aggregate_base_lines_aggregated_values(
+            AccountTax._aggregate_base_lines_tax_details(
+                base_lines, group_by_tax_group
             )
+        )
 
-            amounts = inv._l10n_ar_get_amounts(company_currency=True)
-            amount_total = (1 if inv.is_inbound() else -1) * inv.amount_total_signed
-            vat_amount = amounts["vat_amount"]
-            vat_exempt_base_amount = amounts["vat_exempt_base_amount"]
-            vat_untaxed_base_amount = amounts["vat_untaxed_base_amount"]
-            other_taxes_amount = amounts["other_taxes_amount"]
-            vat_perc_amount = amounts["vat_perc_amount"]
-            iibb_perc_amount = amounts["iibb_perc_amount"]
-            mun_perc_amount = amounts["mun_perc_amount"]
-            intern_tax_amount = amounts["intern_tax_amount"]
-            perc_imp_nacionales_amount = (
-                amounts["profits_perc_amount"] + amounts["other_perc_amount"]
+        is_refund_special = inv.move_type in (
+            "out_refund",
+            "in_refund",
+        ) and inv.l10n_latam_document_type_id.code in (
+            inv._get_l10n_ar_codes_used_for_inv_and_ref()
+        )
+        vat_amount_sign = -1 if is_refund_special else 1
+
+        # acumuladores equivalentes a cada una de las 7 agrupaciones
+        # originales, pero derivados de la unica pasada por tax_group_id
+        vat_by_code = defaultdict(lambda: [0.0, 0.0])  # code -> [base, tax]
+        have_vat_code_amount = 0.0
+        not_vat_taxes_amount = 0.0
+        have_vat_not_012_base = 0.0
+        by_tribute = defaultdict(float)
+        profits_amount = 0.0
+
+        for grouping_key, values in aggregated.items():
+            tax_group = tax_group_by_id.get(grouping_key["tax_group_id"])
+            vat_code = tax_group.l10n_ar_vat_afip_code if tax_group else False
+            tribute_code = (
+                tax_group.l10n_ar_tribute_afip_code if tax_group else False
             )
+            base_amount_currency = values["base_amount_currency"]
+            tax_amount_currency = values["tax_amount_currency"]
 
-            if vat_exempt_base_amount:
-                # operacion con zona franca
-                if inv.partner_id.l10n_ar_afip_responsibility_type_id.code == "10":
-                    codigo_operacion = "Z"
-                # expo al exterior
-                elif inv.l10n_latam_document_type_id.l10n_ar_letter == "E":
-                    codigo_operacion = "X"
-                # operacion exenta
-                else:
-                    codigo_operacion = "E"
-            # despacho de importacion
-            elif inv.l10n_latam_document_type_id.code == "66":
+            if vat_code:
+                have_vat_code_amount += tax_amount_currency
+            else:
+                not_vat_taxes_amount += tax_amount_currency
+
+            if vat_code not in (False, "0", "1", "2"):
+                have_vat_not_012_base += base_amount_currency
+                vat_by_code[vat_code][0] += base_amount_currency
+                vat_by_code[vat_code][1] += tax_amount_currency
+            elif vat_code in ("1", "2"):
+                vat_by_code[vat_code][0] += base_amount_currency
+
+            if tribute_code in ("07", "08", "04", "99", "06"):
+                by_tribute[tribute_code] += tax_amount_currency
+
+            if tax_group and tax_group == profits_tax_group:
+                profits_amount += tax_amount_currency
+
+        vat_taxes = []
+        for code in sorted(k for k in vat_by_code if k not in ("1", "2")):
+            base_amount_currency, tax_amount_currency = vat_by_code[code]
+            if base_amount_currency or tax_amount_currency:
+                entry = {
+                    "Id": code,
+                    "BaseImp": float_round(
+                        vat_amount_sign * base_amount_currency,
+                        precision_digits=2,
+                    ),
+                    "Importe": float_round(
+                        vat_amount_sign * tax_amount_currency,
+                        precision_digits=2,
+                    ),
+                }
+                if code == "3":
+                    entry["Importe"] = 0.0
+                vat_taxes.append(entry)
+
+        amounts = {
+            "vat_amount": have_vat_code_amount,
+            "vat_taxable_amount": have_vat_not_012_base,
+            "vat_exempt_base_amount": vat_by_code["2"][0],
+            "vat_untaxed_base_amount": vat_by_code["1"][0],
+            "not_vat_taxes_amount": not_vat_taxes_amount,
+            "iibb_perc_amount": by_tribute["07"],
+            "mun_perc_amount": by_tribute["08"],
+            "intern_tax_amount": by_tribute["04"],
+            "other_taxes_amount": by_tribute["99"],
+            "profits_perc_amount": profits_amount,
+            "vat_perc_amount": by_tribute["06"],
+            # el original nunca la llena (bug pre-existente en l10n_ar);
+            # lo replicamos para no cambiar el resultado
+            "other_perc_amount": 0.0,
+        }
+
+        if inv.l10n_latam_document_type_id.l10n_ar_letter == "C":
+            amounts["vat_taxable_amount"] = inv.amount_untaxed
+
+        if is_refund_special:
+            for key in amounts:
+                amounts[key] = amounts[key] * -1
+
+        amounts = {
+            key: float_round(value, precision_digits=2)
+            for key, value in amounts.items()
+        }
+
+        return vat_taxes, amounts
+
+    def _get_invoice_cbte_row(self, inv, amounts, cant_alicuotas):
+        self.ensure_one()
+        currency_rate = inv.invoice_currency_rate
+        currency_code = inv.currency_id.l10n_ar_afip_code
+
+        invoice_number, pos_number = self._get_pos_and_invoice_invoice_number(inv)
+        doc_code, doc_number = self._get_partner_document_code_and_number(
+            inv.partner_id
+        )
+
+        amount_total = (1 if inv.is_inbound() else -1) * inv.amount_total_signed
+        vat_amount = amounts["vat_amount"]
+        vat_exempt_base_amount = amounts["vat_exempt_base_amount"]
+        vat_untaxed_base_amount = amounts["vat_untaxed_base_amount"]
+        other_taxes_amount = amounts["other_taxes_amount"]
+        vat_perc_amount = amounts["vat_perc_amount"]
+        iibb_perc_amount = amounts["iibb_perc_amount"]
+        mun_perc_amount = amounts["mun_perc_amount"]
+        intern_tax_amount = amounts["intern_tax_amount"]
+        perc_imp_nacionales_amount = (
+            amounts["profits_perc_amount"] + amounts["other_perc_amount"]
+        )
+
+        if vat_exempt_base_amount:
+            # operacion con zona franca
+            if inv.partner_id.l10n_ar_afip_responsibility_type_id.code == "10":
+                codigo_operacion = "Z"
+            # expo al exterior
+            elif inv.l10n_latam_document_type_id.l10n_ar_letter == "E":
+                codigo_operacion = "X"
+            # operacion exenta
+            else:
                 codigo_operacion = "E"
-            # operacion no gravada
-            elif vat_untaxed_base_amount:
-                codigo_operacion = "N"
-            else:
-                codigo_operacion = " "
+        # despacho de importacion
+        elif inv.l10n_latam_document_type_id.code == "66":
+            codigo_operacion = "E"
+        # operacion no gravada
+        elif vat_untaxed_base_amount:
+            codigo_operacion = "N"
+        else:
+            codigo_operacion = " "
 
-            row = [
-                # Campo 1: Fecha de comprobante
-                inv.invoice_date.strftime("%Y%m%d"),
-                # Campo 2: Tipo de Comprobante.
-                "{:0>3d}".format(int(inv.l10n_latam_document_type_id.code)),
-                # Campo 3: Punto de Venta
-                pos_number,
-                # Campo 4: Número de Comprobante
-                # Si se trata de un comprobante de varias hojas, se deberá
-                # informar el número de documento de la primera hoja, teniendo
-                # en cuenta lo normado en el  artículo 23, inciso a), punto
-                # 6., de la Resolución General N° 1.415, sus modificatorias y
-                # complementarias.
-                # En el supuesto de registrar de manera agrupada por totales
-                # diarios, se deberá consignar el primer número de comprobante
-                # del rango a considerar.
-                invoice_number,
+        row = [
+            # Campo 1: Fecha de comprobante
+            inv.invoice_date.strftime("%Y%m%d"),
+            # Campo 2: Tipo de Comprobante.
+            "{:0>3d}".format(int(inv.l10n_latam_document_type_id.code)),
+            # Campo 3: Punto de Venta
+            pos_number,
+            # Campo 4: Número de Comprobante
+            # Si se trata de un comprobante de varias hojas, se deberá
+            # informar el número de documento de la primera hoja, teniendo
+            # en cuenta lo normado en el  artículo 23, inciso a), punto
+            # 6., de la Resolución General N° 1.415, sus modificatorias y
+            # complementarias.
+            # En el supuesto de registrar de manera agrupada por totales
+            # diarios, se deberá consignar el primer número de comprobante
+            # del rango a considerar.
+            invoice_number,
+        ]
+
+        if self.type == "sale":
+            # Campo 5: Número de Comprobante Hasta.
+            # En el resto de los casos se consignará el dato registrado en el campo 4
+            row.append(invoice_number)
+        else:
+            # Campo 5: Despacho de importación
+            if inv.l10n_latam_document_type_id.code == "66":
+                row.append((inv.l10n_latam_document_number).rjust(16, "0"))
+            else:
+                row.append("".rjust(16, " "))
+
+        row += [
+            # Campo 6: Código de documento del comprador.
+            doc_code,
+            # Campo 7: Número de Identificación del comprador
+            doc_number,
+            # Campo 8: Apellido y Nombre del comprador.
+            inv.commercial_partner_id.name.ljust(30, " ")[:30],
+            # Campo 9: Importe Total de la Operación.
+            self.format_amount(amount_total),
+            # Campo 10: Importe total de conceptos que no integran el precio neto gravado
+            self.format_amount(vat_untaxed_base_amount),
+        ]
+
+        if self.type == "sale":
+            row += [
+                # Campo 11: Percepción a no categorizados
+                # la figura no categorizado / responsable no inscripto no se usa más
+                self.format_amount(0.0),
+                # Campo 12: Importe de operaciones exentas
+                self.format_amount(vat_exempt_base_amount),
+                # Campo 13: Importe de percepciones o pagos a cuenta de impuestos Nacionales
+                self.format_amount(perc_imp_nacionales_amount + vat_perc_amount),
+            ]
+        else:
+            row += [
+                # Campo 11: Importe de operaciones exentas
+                self.format_amount(vat_exempt_base_amount),
+                # Campo 12: Importe de percepciones o pagos a cuenta del Impuesto al Valor Agregado
+                self.format_amount(vat_perc_amount),
+                # Campo 13: Importe de percepciones o pagos a cuenta otros impuestos nacionales
+                self.format_amount(perc_imp_nacionales_amount),
             ]
 
-            if self.type == "sale":
-                # Campo 5: Número de Comprobante Hasta.
-                # En el resto de los casos se consignará el dato registrado en el campo 4
-                row.append(invoice_number)
-            else:
-                # Campo 5: Despacho de importación
-                if inv.l10n_latam_document_type_id.code == "66":
-                    row.append((inv.l10n_latam_document_number).rjust(16, "0"))
+        row += [
+            # Campo 14: Importe de percepciones de ingresos brutos
+            self.format_amount(iibb_perc_amount),
+            # Campo 15: Importe de percepciones de impuestos municipales
+            self.format_amount(mun_perc_amount),
+            # Campo 16: Importe de impuestos internos
+            self.format_amount(intern_tax_amount),
+            # Campo 17: Código de Moneda
+            str(currency_code),
+            # Campo 18: Tipo de Cambio
+            # nueva modalidad de currency_rate
+            self.format_amount(currency_rate, padding=10, decimals=6),
+            # Campo 19: Cantidad de alícuotas de IVA
+            str(cant_alicuotas),
+            # Campo 20: Código de operación.
+            codigo_operacion,
+        ]
+
+        if self.type == "sale":
+            row += [
+                # Campo 21: Otros Tributos
+                self.format_amount(other_taxes_amount),
+                # Campo 22: vencimiento comprobante (no figura en
+                # instructivo pero si en aplicativo) para tique y factura
+                # de exportacion no se informa, tmb para algunos otros
+                # pero que tampoco tenemos implementados
+                (
+                    inv.l10n_latam_document_type_id.code
+                    in [
+                        "19",
+                        "20",
+                        "21",
+                        "16",
+                        "55",
+                        "81",
+                        "82",
+                        "83",
+                        "110",
+                        "111",
+                        "112",
+                        "113",
+                        "114",
+                        "115",
+                        "116",
+                        "117",
+                        "118",
+                        "119",
+                        "120",
+                        "201",
+                        "202",
+                        "203",
+                        "206",
+                        "207",
+                        "208",
+                        "211",
+                        "212",
+                        "213",
+                    ]
+                    and "00000000"
+                    or inv.invoice_date_due.strftime("%Y%m%d")
+                ),
+            ]
+        else:
+            # Campo 21: Crédito Fiscal Computable
+            if self.prorate_tax_credit:
+                if self.prorate_type == "global":
+                    row.append(self.format_amount(0))
                 else:
-                    row.append("".rjust(16, " "))
-
-            row += [
-                # Campo 6: Código de documento del comprador.
-                doc_code,
-                # Campo 7: Número de Identificación del comprador
-                doc_number,
-                # Campo 8: Apellido y Nombre del comprador.
-                inv.commercial_partner_id.name.ljust(30, " ")[:30],
-                # Campo 9: Importe Total de la Operación.
-                self.format_amount(amount_total),
-                # Campo 10: Importe total de conceptos que no integran el precio neto gravado
-                self.format_amount(vat_untaxed_base_amount),
-            ]
-
-            if self.type == "sale":
-                row += [
-                    # Campo 11: Percepción a no categorizados
-                    # la figura no categorizado / responsable no inscripto no se usa más
-                    self.format_amount(0.0),
-                    # Campo 12: Importe de operaciones exentas
-                    self.format_amount(vat_exempt_base_amount),
-                    # Campo 13: Importe de percepciones o pagos a cuenta de impuestos Nacionales
-                    self.format_amount(perc_imp_nacionales_amount + vat_perc_amount),
-                ]
-            else:
-                row += [
-                    # Campo 11: Importe de operaciones exentas
-                    self.format_amount(vat_exempt_base_amount),
-                    # Campo 12: Importe de percepciones o pagos a cuenta del Impuesto al Valor Agregado
-                    self.format_amount(vat_perc_amount),
-                    # Campo 13: Importe de percepciones o pagos a cuenta otros impuestos nacionales
-                    self.format_amount(perc_imp_nacionales_amount),
-                ]
-
-            row += [
-                # Campo 14: Importe de percepciones de ingresos brutos
-                self.format_amount(iibb_perc_amount),
-                # Campo 15: Importe de percepciones de impuestos municipales
-                self.format_amount(mun_perc_amount),
-                # Campo 16: Importe de impuestos internos
-                self.format_amount(intern_tax_amount),
-                # Campo 17: Código de Moneda
-                str(currency_code),
-                # Campo 18: Tipo de Cambio
-                # nueva modalidad de currency_rate
-                self.format_amount(currency_rate, padding=10, decimals=6),
-                # Campo 19: Cantidad de alícuotas de IVA
-                str(cant_alicuotas),
-                # Campo 20: Código de operación.
-                codigo_operacion,
-            ]
-
-            if self.type == "sale":
-                row += [
-                    # Campo 21: Otros Tributos
-                    self.format_amount(other_taxes_amount),
-                    # Campo 22: vencimiento comprobante (no figura en
-                    # instructivo pero si en aplicativo) para tique y factura
-                    # de exportacion no se informa, tmb para algunos otros
-                    # pero que tampoco tenemos implementados
-                    (
-                        inv.l10n_latam_document_type_id.code
-                        in [
-                            "19",
-                            "20",
-                            "21",
-                            "16",
-                            "55",
-                            "81",
-                            "82",
-                            "83",
-                            "110",
-                            "111",
-                            "112",
-                            "113",
-                            "114",
-                            "115",
-                            "116",
-                            "117",
-                            "118",
-                            "119",
-                            "120",
-                            "201",
-                            "202",
-                            "203",
-                            "206",
-                            "207",
-                            "208",
-                            "211",
-                            "212",
-                            "213",
-                        ]
-                        and "00000000"
-                        or inv.invoice_date_due.strftime("%Y%m%d")
-                    ),
-                ]
-            else:
-                # Campo 21: Crédito Fiscal Computable
-                if self.prorate_tax_credit:
-                    if self.prorate_type == "global":
-                        row.append(self.format_amount(0))
-                    else:
-                        # row.append(self.format_amount(0))
-                        # por ahora no implementado pero seria lo mismo que
-                        # sacar si prorrateo y que el cliente entre en el txt
-                        # en cada comprobante y complete cuando es en
-                        # credito fiscal computable
-                        raise ValidationError(
-                            _(
-                                "Para utilizar el prorrateo por comprobante:\n"
-                                '1) Exporte los archivos sin la opción "Proratear '
-                                'Crédito de Impuestos"\n2) Importe los mismos '
-                                "en el aplicativo\n3) En el aplicativo de afip, "
-                                "comprobante por comprobante, indique el valor "
-                                'correspondiente en el campo "Crédito Fiscal '
-                                'Computable"'
-                            )
+                    # row.append(self.format_amount(0))
+                    # por ahora no implementado pero seria lo mismo que
+                    # sacar si prorrateo y que el cliente entre en el txt
+                    # en cada comprobante y complete cuando es en
+                    # credito fiscal computable
+                    raise ValidationError(
+                        _(
+                            "Para utilizar el prorrateo por comprobante:\n"
+                            '1) Exporte los archivos sin la opción "Proratear '
+                            'Crédito de Impuestos"\n2) Importe los mismos '
+                            "en el aplicativo\n3) En el aplicativo de afip, "
+                            "comprobante por comprobante, indique el valor "
+                            'correspondiente en el campo "Crédito Fiscal '
+                            'Computable"'
                         )
-                else:
-                    row.append(self.format_amount(vat_amount))
+                    )
+            else:
+                row.append(self.format_amount(vat_amount))
 
-                liquido_type = inv.l10n_latam_document_type_id.code in [
-                    "033",
-                    "058",
-                    "059",
-                    "060",
-                    "063",
-                ]
-                row += [
-                    # Campo 22: Otros Tributos
-                    self.format_amount(other_taxes_amount),
-                    # TODO still not implemented on this three fields for use case with third pary commisioner
-                    # Campo 23: CUIT Emisor / Corredor
-                    # Se informará sólo si en el campo "Tipo de Comprobante" se consigna '033', '058', '059', '060' ó
-                    # '063'. Si para éstos comprobantes no interviene un tercero en la operación, se consignará la
-                    # C.U.I.T. del informante. Para el resto de los comprobantes se completará con ceros
-                    self.format_amount(
-                        liquido_type and inv.company_id.partner_id.ensure_vat() or 0,
-                        padding=11,
-                    ),
-                    # Campo 24: Denominación Emisor / Corredor
-                    (liquido_type and inv.company_id.name or "").ljust(30, " ")[:30],
-                    # Campo 25: IVA Comisión
-                    # Si el campo 23 es distinto de cero se consignará el importe del I.V.A. de la comisión
-                    self.format_amount(0),
-                ]
-            res.append("".join(row))
-        self.REGINFO_CV_CBTE = "\r\n".join(res)
+            liquido_type = inv.l10n_latam_document_type_id.code in [
+                "033",
+                "058",
+                "059",
+                "060",
+                "063",
+            ]
+            row += [
+                # Campo 22: Otros Tributos
+                self.format_amount(other_taxes_amount),
+                # TODO still not implemented on this three fields for use case with third pary commisioner
+                # Campo 23: CUIT Emisor / Corredor
+                # Se informará sólo si en el campo "Tipo de Comprobante" se consigna '033', '058', '059', '060' ó
+                # '063'. Si para éstos comprobantes no interviene un tercero en la operación, se consignará la
+                # C.U.I.T. del informante. Para el resto de los comprobantes se completará con ceros
+                self.format_amount(
+                    liquido_type and inv.company_id.partner_id.ensure_vat() or 0,
+                    padding=11,
+                ),
+                # Campo 24: Denominación Emisor / Corredor
+                (liquido_type and inv.company_id.name or "").ljust(30, " ")[:30],
+                # Campo 25: IVA Comisión
+                # Si el campo 23 es distinto de cero se consignará el importe del I.V.A. de la comisión
+                self.format_amount(0),
+            ]
+        return "".join(row)
 
     def _get_tax_row(self, invoice, base, code, tax_amount, impo=False):
         self.ensure_one()
@@ -642,49 +794,37 @@ class AccountVatLedger(models.Model):
             ]
         return row
 
-    def _get_REGINFO_CV_ALICUOTAS(self, impo=False):
-        """
-        Devolvemos un dict para calcular la cantidad de alicuotas cuando
-        hacemos los comprobantes
+    def _get_invoice_alicuota_lines(self, inv, vat_taxes, impo=False):
+        """Lineas del txt de alicuotas (o de importaciones si impo=True)
+        para UN comprobante.
+
+        only vat taxes with codes 3, 4, 5, 6, 8, 9 segun:
+        http://contadoresenred.com/regimen-de-informacion-de-compras-y-ventas-rg-3685-como-cargar-la-informacion/
+        empezamos a contar los codigos 1 (no gravado) y 2 (exento) si no hay alicuotas, sumamos una de esta con
+        0, 0, 0 en detalle usamos mapped por si hay afip codes duplicados (ej. manual y auto)
         """
         self.ensure_one()
-        res = {}
-        # only vat taxes with codes 3, 4, 5, 6, 8, 9 segun:
-        # http://contadoresenred.com/regimen-de-informacion-de-compras-y-ventas-rg-3685-como-cargar-la-informacion/
-        # empezamos a contar los codigos 1 (no gravado) y 2 (exento) si no hay alicuotas, sumamos una de esta con
-        # 0, 0, 0 en detalle usamos mapped por si hay afip codes duplicados (ej. manual y auto)
-        if impo:
-            invoices = self._get_txt_invoices().filtered(
-                lambda r: r.l10n_latam_document_type_id.code == "66"
-            )
-        else:
-            invoices = self._get_txt_invoices().filtered(
-                lambda r: r.l10n_latam_document_type_id.code != "66"
-            )
-        for inv in invoices:
-            lines = []
-            vat_taxes = inv._get_vat()
+        lines = []
 
-            # tipically this is for invoices with zero amount
-            if (
-                not vat_taxes
-                and inv.l10n_latam_document_type_id.purchase_aliquots == "not_zero"
-            ):
-                lines.append("".join(self._get_tax_row(inv, 0.0, 3, 0.0, impo=impo)))
+        # tipically this is for invoices with zero amount
+        if (
+            not vat_taxes
+            and inv.l10n_latam_document_type_id.purchase_aliquots == "not_zero"
+        ):
+            lines.append("".join(self._get_tax_row(inv, 0.0, 3, 0.0, impo=impo)))
 
-            # we group by afip_code
-            for vat_tax in vat_taxes:
-                lines.append(
-                    "".join(
-                        self._get_tax_row(
-                            inv,
-                            vat_tax["BaseImp"],
-                            vat_tax["Id"],
-                            vat_tax["Importe"],
-                            impo=impo,
-                        )
+        # we group by afip_code
+        for vat_tax in vat_taxes:
+            lines.append(
+                "".join(
+                    self._get_tax_row(
+                        inv,
+                        vat_tax["BaseImp"],
+                        vat_tax["Id"],
+                        vat_tax["Importe"],
+                        impo=impo,
                     )
                 )
+            )
 
-            res[inv] = lines
-        return res
+        return lines
