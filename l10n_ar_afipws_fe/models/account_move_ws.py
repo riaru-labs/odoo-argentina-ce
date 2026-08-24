@@ -359,7 +359,13 @@ class AccountMove(models.Model):
         # no se pasa iva. Probamos hacer que vat_taxable_amount
         # incorpore a los imp cod 0, pero en ese caso termina reportando
         # iva y no lo queremos
-        if self.reversed_entry_id or self.l10n_latam_document_type_id.l10n_ar_letter == "C":
+        # debit_note_amounts_locked (fs_account_debit_note_copy_lines, optional
+        # module) marks debit notes whose line amounts were force-restored to
+        # verbatim match their origin credit note -- for those, amounts["*"]
+        # (a live tax-engine recompute) can disagree with what was actually
+        # frozen into line_ids, same reason reversed_entry_id/letter C use
+        # the real stored values instead.
+        if self.reversed_entry_id or self.l10n_latam_document_type_id.l10n_ar_letter == "C" or getattr(self, 'debit_note_amounts_locked', False):
             invoice_info["imp_neto"] = str("%.2f" % self.amount_untaxed)
         else:
             invoice_info["imp_neto"] = str("%.2f" % amounts["vat_taxable_amount"])
