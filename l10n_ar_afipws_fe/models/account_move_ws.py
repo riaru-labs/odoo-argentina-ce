@@ -366,7 +366,13 @@ class AccountMove(models.Model):
         # frozen into line_ids, same reason reversed_entry_id/letter C use
         # the real stored values instead.
         if self.reversed_entry_id or self.l10n_latam_document_type_id.l10n_ar_letter == "C" or getattr(self, 'debit_note_amounts_locked', False):
-            invoice_info["imp_neto"] = str("%.2f" % self.amount_untaxed)
+            # self.amount_untaxed incluye las bases exenta (imp_op_ex) y no
+            # gravada (imp_tot_conc), que ya se reportan por separado: hay
+            # que restarlas para no duplicarlas en la suma que valida AFIP
+            # (error 10048)
+            invoice_info["imp_neto"] = str(
+                "%.2f" % (self.amount_untaxed - amounts["vat_exempt_base_amount"] - amounts["vat_untaxed_base_amount"])
+            )
         else:
             invoice_info["imp_neto"] = str("%.2f" % amounts["vat_taxable_amount"])
 
