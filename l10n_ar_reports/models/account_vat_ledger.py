@@ -331,6 +331,12 @@ class AccountVatLedger(models.Model):
             self.import_aliquots_filename = False
         self._set_txt_file("vouchers_file", "vouchers_filename", "Vouchers", cbte_lines)
 
+    @staticmethod
+    def _prefetch_optional(records, path):
+        """mapped() de un campo que puede no existir. Solo para prefetch."""
+        if records and path.split(".")[0] in records._fields:
+            records.mapped(path)
+
     def _prefetch_txt_data(self, invoices):
         if not invoices:
             return
@@ -343,8 +349,13 @@ class AccountVatLedger(models.Model):
         # _get_downpayment_lines() al armar base_lines
         sale_lines.mapped("is_downpayment")
         sale_lines.mapped("invoice_lines")
-        sale_lines.mapped("reward_id.reward_type")
-        sale_lines.mapped("company_id.sale_discount_product_id")
+        # reward_id (sale_loyalty) y sale_discount_product_id son opcionales:
+        # existen solo si esos modulos estan instalados. Esto es prefetch, o
+        # sea cache: si el campo no esta, no hay nada que precargar y seguimos.
+        # Sin esta guarda el Libro IVA explota con KeyError: 'reward_id' en
+        # cualquier instalacion sin sale_loyalty.
+        self._prefetch_optional(sale_lines, "reward_id.reward_type")
+        self._prefetch_optional(sale_lines, "company_id.sale_discount_product_id")
         # _get_partner_document_code_and_number usa partner_id o
         # commercial_partner_id segun el caso; precargamos ambos
         partners = invoices.mapped("partner_id") | invoices.mapped(
